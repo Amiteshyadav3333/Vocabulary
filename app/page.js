@@ -3,7 +3,15 @@ import { useState, useEffect, useRef } from 'react';
 
 export default function Game() {
   const [mounted, setMounted] = useState(false);
-  const [gameState, setGameState] = useState('setup');
+
+  // Network States
+  const [networkPhase, setNetworkPhase] = useState('menu'); // 'menu', 'setup', 'playing', 'ended'
+  const [roomId, setRoomId] = useState('');
+  const [playerIndex, setPlayerIndex] = useState(null); // 0 for Host, 1 for Guest
+  const [roomUrl, setRoomUrl] = useState('');
+  const [connectionStatus, setConnectionStatus] = useState('Disconnected 🔴');
+
+  // Game States
   const [players, setPlayers] = useState([
     { name: '', emoji: '😀', score: 0, missedTurns: 0 },
     { name: '', emoji: '😎', score: 0, missedTurns: 0 }
@@ -15,74 +23,227 @@ export default function Game() {
   const [selectedCells, setSelectedCells] = useState([]);
   const [claimedWords, setClaimedWords] = useState([]);
   const [currentWord, setCurrentWord] = useState('');
-  const [meaning, setMeaning] = useState('');
-  const [showMeaningInput, setShowMeaningInput] = useState(false);
-  const [challenge, setChallenge] = useState(null);
   const [messages, setMessages] = useState([]);
-  const [chatInput, setChatInput] = useState('');
   const [board, setBoard] = useState(Array(10).fill(null).map(() => Array(10).fill('')));
+  const [chatInput, setChatInput] = useState('');
+
   const timerRef = useRef(null);
+
+  // Refs for callbacks
+  const stateRef = useRef();
+  const peerRef = useRef(null);
+  const connRef = useRef(null);
 
   const emojis = ['😀', '😎', '🎮', '🚀', '⭐', '🔥', '💎', '🎯', '🏆', '👑', '🎨', '🌟', '💪', '🎭', '🦄', '🐉', '🌈', '⚡', '🎪', '🎸'];
   const chatEmojis = ['😊', '😂', '🤣', '😍', '🥳', '😱', '🤔', '👍', '👏', '🙌', '💯', '🔥', '❤️', '✨', '🎉', '😅', '😎', '🤩', '😜', '🤗'];
 
+  // Sync state reference for PeerJS callbacks
   useEffect(() => {
-    setMounted(true);
-  }, []);
+    stateRef.current = {
+      networkPhase, players, targetScore, currentPlayer,
+      turnPhase, timeLeft, selectedCells, claimedWords, currentWord, messages, board
+    };
+  });
+
+  const applyUpdates = (updates) => {
+    if ('networkPhase' in updates) setNetworkPhase(updates.networkPhase);
+    if ('players' in updates) setPlayers(updates.players);
+    if ('targetScore' in updates) setTargetScore(updates.targetScore);
+    if ('currentPlayer' in updates) setCurrentPlayer(updates.currentPlayer);
+    if ('turnPhase' in updates) setTurnPhase(updates.turnPhase);
+    if ('timeLeft' in updates) setTimeLeft(updates.timeLeft);
+    if ('selectedCells' in updates) setSelectedCells(updates.selectedCells);
+    if ('claimedWords' in updates) setClaimedWords(updates.claimedWords);
+    if ('currentWord' in updates) setCurrentWord(updates.currentWord);
+    if ('messages' in updates) setMessages(updates.messages);
+    if ('board' in updates) setBoard(updates.board);
+  };
+
+  const emitUpdate = (updates) => {
+    applyUpdates(updates);
+    if (connRef.current && connRef.current.open) {
+      connRef.current.send({ type: 'UPDATE', updates });
+    }
+  };
+
+  const setupConnection = (conn, isHost) => {
+    connRef.current = conn;
+    conn.on('open', () => {
+      setConnectionStatus('Connected! 🟢');
+      if (isHost) {
+        conn.send({ type: 'SYNC', state: stateRef.current });
+      }
+    });
+
+    conn.on('data', (data) => {
+      if (data.type === 'SYNC') {
+        applyUpdates(data.state);
+      } else if (data.type === 'UPDATE') {
+        applyUpdates(data.updates);
+      }
+    });
+
+    conn.on('close', () => {
+      setConnectionStatus('Disconnected 🔴');
+    });
+
+    conn.on('error', (err) => {
+      console.error("Connection Error:", err);
+    });
+  };
 
   useEffect(() => {
-    if (gameState === 'playing') {
+    setMounted(true);
+
+    const urlParams = new URLSearchParams(window.location.search);
+    const roomFromUrl = urlParams.get('room');
+    if (roomFromUrl) {
+      const cleanRoom = roomFromUrl.toUpperCase();
+      setRoomId(cleanRoom);
+      joinRoomBtn(cleanRoom);
+      window.history.pushState({}, document.title, window.location.pathname);
+    }
+
+    return () => {
+      if (connRef.current) connRef.current.close();
+      if (peerRef.current) peerRef.current.destroy();
+    };
+  }, []);
+
+  const createRoom = async () => {
+    try {
+      const Peer = (await import('peerjs')).default;
+      const newRoom = Math.random().toString(36).substring(2, 7).toUpperCase();
+      setRoomId(newRoom);
+      setPlayerIndex(0); // I am Host
+      setNetworkPhase('setup');
+      setConnectionStatus('Waiting for Player 2...');
+
+      const u = new URL(window.location.href);
+      u.searchParams.set('room', newRoom);
+      setRoomUrl(u.toString());
+
+      const peer = new Peer(`VOCAB-${newRoom}`);
+      peerRef.current = peer;
+
+      peer.on('connection', (conn) => {
+        setupConnection(conn, true);
+      });
+
+      peer.on('error', err => {
+        alert('Peer error: ' + err.message);
+      });
+    } catch (e) {
+      console.error("Failed to load Peer", e);
+    }
+  };
+
+  const joinRoomBtn = async (overrideRoomId = null) => {
+    const targetRoom = (overrideRoomId || roomId).trim().toUpperCase();
+    if (!targetRoom) return;
+    setRoomId(targetRoom);
+    setPlayerIndex(1); // I am Guest
+    setNetworkPhase('setup');
+    setConnectionStatus('Connecting to Host...');
+
+    try {
+      const Peer = (await import('peerjs')).default;
+      const peer = new Peer();
+      peerRef.current = peer;
+
+      peer.on('open', () => {
+        const conn = peer.connect(`VOCAB-${targetRoom}`);
+        setupConnection(conn, false);
+      });
+
+      peer.on('error', (err) => {
+        alert('Failed to connect to room. Make sure the code is correct!');
+        setConnectionStatus('Connection Failed 🔴');
+      });
+    } catch (e) {
+      console.error("Failed to load Peer", e);
+    }
+  };
+
+  // Timer Tick - Completely driven locally to avoid latency jitter on clock update
+  useEffect(() => {
+    if (networkPhase === 'playing') {
       timerRef.current = setInterval(() => {
-        setTimeLeft(prev => prev - 1);
+        if (playerIndex === 0) { // Keep time in sync by only sending ticks from host occasionally, but we trust local decrements mostly
+          setTimeLeft(prev => {
+            const nextTime = prev - 1;
+            // Every 5 seconds host broadcasts the exact time to prevent drift
+            if (nextTime % 5 === 0) {
+              if (connRef.current && connRef.current.open) {
+                connRef.current.send({ type: 'UPDATE', updates: { timeLeft: nextTime } });
+              }
+            }
+            return nextTime;
+          });
+        } else if (playerIndex === 1) {
+          setTimeLeft(prev => prev - 1);
+        }
       }, 1000);
     } else {
       clearInterval(timerRef.current);
     }
     return () => clearInterval(timerRef.current);
-  }, [gameState]);
+  }, [networkPhase, currentPlayer, turnPhase]); // re-bind to sync
 
+  // Timer Expiration Logic (Only Host fires this rule)
   useEffect(() => {
-    if (gameState === 'playing' && timeLeft <= 0) {
+    if (networkPhase === 'playing' && timeLeft <= 0 && playerIndex === 0) {
       handleTimeout();
     }
-  }, [timeLeft, gameState]);
+  }, [timeLeft, networkPhase, playerIndex]);
 
   const handleTimeout = () => {
-    const newPlayers = [...players];
-    newPlayers[currentPlayer].missedTurns++;
-    if (newPlayers[currentPlayer].missedTurns >= 5) {
-      setGameState('ended');
-      addMessage(`${newPlayers[1 - currentPlayer].emoji} ${newPlayers[1 - currentPlayer].name} wins! Opponent missed 5 turns.`);
-    } else {
-      addMessage(`⏰ ${players[currentPlayer].emoji} ${players[currentPlayer].name} ran out of time!`);
-      setPlayers(newPlayers);
-      endTurn();
-    }
-  };
+    const s = stateRef.current;
+    const currP = s.currentPlayer;
+    const newPlayers = [...s.players];
+    newPlayers[currP] = { ...newPlayers[currP], missedTurns: newPlayers[currP].missedTurns + 1 };
 
-  const startGame = () => {
-    if (players[0].name && players[1].name && targetScore > 0) {
-      setGameState('playing');
-      setTurnPhase('place_letter');
-      addMessage(`🎮 Game started! First to ${Math.floor(targetScore / 2) + 1} points (more than half of ${targetScore}) wins!`);
+    if (newPlayers[currP].missedTurns >= 5) {
+      const msg = `⏰ ${newPlayers[1 - currP].emoji} ${newPlayers[1 - currP].name} wins! Opponent missed 5 turns.`;
+      emitUpdate({
+        networkPhase: 'ended',
+        players: newPlayers,
+        messages: [...s.messages, { text: msg, time: new Date().toLocaleTimeString() }]
+      });
+    } else {
+      const msg = `⏰ ${newPlayers[currP].emoji} ${newPlayers[currP].name} ran out of time!`;
+      emitUpdate({
+        players: newPlayers,
+        messages: [...s.messages, { text: msg, time: new Date().toLocaleTimeString() }],
+        currentPlayer: 1 - currP,
+        timeLeft: 60,
+        selectedCells: [],
+        currentWord: '',
+        turnPhase: 'place_letter'
+      });
     }
   };
 
   const endTurn = () => {
-    setCurrentPlayer(prev => 1 - prev);
-    setTimeLeft(60);
-    setSelectedCells([]);
-    setCurrentWord('');
-    setTurnPhase('place_letter');
+    if (playerIndex !== currentPlayer) return;
+    emitUpdate({
+      currentPlayer: 1 - currentPlayer,
+      timeLeft: 60,
+      selectedCells: [],
+      currentWord: '',
+      turnPhase: 'place_letter'
+    });
   };
 
   const handleCellClick = (row, col) => {
+    if (playerIndex !== currentPlayer) return; // Prevent opponent taking ghost acts
+
     const cellId = `${row}-${col}`;
     const cellContent = board[row][col];
 
     if (turnPhase === 'place_letter') {
       if (cellContent !== '') return;
-      setSelectedCells([{ id: cellId, row, col }]);
+      emitUpdate({ selectedCells: [{ id: cellId, row, col }] });
     } else if (turnPhase === 'claim_word') {
       if (cellContent === '') return;
 
@@ -107,102 +268,169 @@ export default function Game() {
       if (isSelected) return;
 
       const newSelected = [...selectedCells, { id: cellId, row, col }];
-      setSelectedCells(newSelected);
-
       const word = newSelected.map(c => board[c.row][c.col]).join('');
-      setCurrentWord(word);
+      // Live sync
+      emitUpdate({ selectedCells: newSelected, currentWord: word });
     }
   };
 
   const handleLetterInput = (row, col, letter) => {
+    if (playerIndex !== currentPlayer) return;
     if (turnPhase !== 'place_letter') return;
     if (!letter.trim()) return;
 
     if (!/^[a-zA-Z]$/.test(letter)) {
-      addMessage(`⚠️ Only English letters (A-Z) are allowed!`);
+      emitUpdate({
+        messages: [...stateRef.current.messages, { text: `⚠️ Only English letters (A-Z) are allowed!`, time: new Date().toLocaleTimeString() }]
+      });
       return;
     }
 
     const newBoard = board.map(r => [...r]);
     newBoard[row][col] = letter.toUpperCase();
-    setBoard(newBoard);
 
-    setSelectedCells([]);
-    setCurrentWord('');
-    setTurnPhase('claim_word');
+    emitUpdate({
+      board: newBoard,
+      selectedCells: [],
+      currentWord: '',
+      turnPhase: 'claim_word'
+    });
   };
 
   const claimWordPoints = () => {
+    if (playerIndex !== currentPlayer) return;
     if (currentWord.length < 2) return;
 
     if (claimedWords.includes(currentWord)) {
-      addMessage(`⚠️ The word "${currentWord}" has already been claimed!`);
-      setSelectedCells([]);
-      setCurrentWord('');
+      emitUpdate({
+        messages: [...stateRef.current.messages, { text: `⚠️ The word "${currentWord}" has already been claimed!`, time: new Date().toLocaleTimeString() }],
+        selectedCells: [],
+        currentWord: ''
+      });
       return;
     }
 
     const points = currentWord.length;
     const newPlayers = [...players];
-    newPlayers[currentPlayer].score += points;
-    newPlayers[currentPlayer].missedTurns = 0;
-    setPlayers(newPlayers);
-    setClaimedWords(prev => [...prev, currentWord]);
+    newPlayers[currentPlayer] = { ...newPlayers[currentPlayer], score: newPlayers[currentPlayer].score + points, missedTurns: 0 };
 
-    addMessage(`🌟 ${players[currentPlayer].emoji} ${players[currentPlayer].name} claimed "${currentWord}" (+${points} pts)`);
+    const newClaimed = [...claimedWords, currentWord];
+    const newMsgs = [...stateRef.current.messages, { text: `🌟 ${newPlayers[currentPlayer].emoji} ${newPlayers[currentPlayer].name} claimed "${currentWord}" (+${points} pts)`, time: new Date().toLocaleTimeString() }];
 
     const winThreshold = Math.floor(targetScore / 2) + 1;
     if (newPlayers[currentPlayer].score >= winThreshold) {
-      setGameState('ended');
-      addMessage(`🏆 ${players[currentPlayer].emoji} ${players[currentPlayer].name} wins!`);
+      newMsgs.push({ text: `🏆 ${newPlayers[currentPlayer].emoji} ${newPlayers[currentPlayer].name} wins!`, time: new Date().toLocaleTimeString() });
+      emitUpdate({
+        networkPhase: 'ended',
+        players: newPlayers,
+        claimedWords: newClaimed,
+        messages: newMsgs
+      });
       return;
     }
 
-    endTurn();
-  };
-
-
-
-  const addMessage = (msg) => {
-    setMessages(prev => [...prev, { text: msg, time: new Date().toLocaleTimeString() }]);
+    emitUpdate({
+      players: newPlayers,
+      claimedWords: newClaimed,
+      messages: newMsgs,
+      currentPlayer: 1 - currentPlayer,
+      timeLeft: 60,
+      selectedCells: [],
+      currentWord: '',
+      turnPhase: 'place_letter'
+    });
   };
 
   const sendChat = () => {
     if (chatInput.trim()) {
-      addMessage(`${players[currentPlayer].emoji} ${players[currentPlayer].name}: ${chatInput}`);
+      const s = stateRef.current;
+      const myPlayer = s.players[playerIndex] || s.players[0];
+      const newMsg = { text: `${myPlayer.emoji} ${myPlayer.name}: ${chatInput}`, time: new Date().toLocaleTimeString() };
+      emitUpdate({ messages: [...s.messages, newMsg] });
       setChatInput('');
     }
   };
 
+  const resetSelection = () => {
+    if (playerIndex !== currentPlayer) return;
+    emitUpdate({ selectedCells: [], currentWord: '' });
+  };
+
   if (!mounted) return null;
 
-  if (gameState === 'setup') {
+  // Render Logic
+  if (networkPhase === 'menu') {
     return (
       <div style={styles.container}>
-        <h1 style={styles.title} className="titleResponsive">🎮 Vocabulary Battle</h1>
+        <h1 style={styles.title} className="titleResponsive">🌐 Vocabulary Battle Online</h1>
+        <div style={{ ...styles.setupBox, textAlign: 'center' }} className="setupBoxResponsive">
+          <button style={styles.startBtn} onClick={createRoom}>🏠 Create New Room (Host Game)</button>
+
+          <div style={{ margin: '40px 0', fontSize: '24px', fontWeight: 'bold', color: '#666' }}>OR</div>
+
+          <div style={{ background: '#f8f9ff', padding: '20px', borderRadius: '15px', border: '2px solid #ddd' }}>
+            <input
+              style={{ ...styles.input, textAlign: 'center', fontSize: '24px', letterSpacing: '2px', fontWeight: 'bold', textTransform: 'uppercase' }}
+              placeholder="Enter 5-Letter Code"
+              maxLength={5}
+              value={roomId}
+              onChange={e => setRoomId(e.target.value)}
+            />
+            <button style={{ ...styles.startBtn, background: '#4caf50' }} onClick={() => joinRoomBtn()}>🔗 Join Existing Room</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (networkPhase === 'setup') {
+    return (
+      <div style={styles.container}>
+        <h1 style={styles.title} className="titleResponsive">🌐 Multiplayer Waiting...</h1>
+
+        <div style={{ textAlign: 'center', marginBottom: '30px' }}>
+          <h2 style={{ color: 'white', background: 'rgba(0,0,0,0.5)', display: 'inline-block', padding: '10px 30px', borderRadius: '15px' }}>
+            Room Code: <span style={{ color: '#ffeb3b', letterSpacing: '2px' }}>{roomId}</span>
+          </h2>
+
+          {playerIndex === 0 && (
+            <div style={{ marginTop: '15px' }}>
+              <button style={{ padding: '10px 20px', background: '#e91e63', color: 'white', border: 'none', borderRadius: '8px', cursor: 'pointer', fontSize: '18px', fontWeight: 'bold' }}
+                onClick={() => navigator.clipboard.writeText(roomUrl || window.location.href)}>
+                📋 Copy Direct Invite Link
+              </button>
+            </div>
+          )}
+          <p style={{ color: 'white', marginTop: '15px', fontSize: '18px' }}>
+            {connectionStatus}
+          </p>
+        </div>
+
         <div style={styles.setupBox} className="setupBoxResponsive">
           {players.map((p, i) => (
-            <div key={i} style={styles.playerSetup}>
-              <h3>Player {i + 1}</h3>
+            <div key={i} style={{ ...styles.playerSetup, opacity: playerIndex !== i ? 0.3 : 1 }}>
+              <h3>Player {i + 1} {playerIndex === i ? '(You)' : ''} {playerIndex !== i ? '(Opponent)' : ''}</h3>
               <input
                 style={styles.input}
-                placeholder="Enter name"
+                placeholder={playerIndex === i ? "Enter your name" : "Waiting for player..."}
                 value={p.name}
+                disabled={playerIndex !== i}
                 onChange={(e) => {
                   const newPlayers = [...players];
                   newPlayers[i].name = e.target.value;
-                  setPlayers(newPlayers);
+                  emitUpdate({ players: newPlayers });
                 }}
               />
               <div style={styles.emojiGrid} className="emojiGridResponsive">
                 {emojis.map(emoji => (
                   <button
                     key={emoji}
+                    disabled={playerIndex !== i}
                     style={{ ...styles.emojiBtn, ...(p.emoji === emoji ? styles.selectedEmoji : {}) }}
                     onClick={() => {
                       const newPlayers = [...players];
                       newPlayers[i].emoji = emoji;
-                      setPlayers(newPlayers);
+                      emitUpdate({ players: newPlayers });
                     }}
                   >
                     {emoji}
@@ -211,44 +439,75 @@ export default function Game() {
               </div>
             </div>
           ))}
-          <div style={{ marginBottom: '20px', textAlign: 'center' }}>
-            <label style={{ color: 'black', fontSize: '18px', fontWeight: 'bold' }}>Total Points (Decide in chat): </label>
-            <input
-              type="number"
-              style={{ ...styles.input, width: '100px', display: 'inline-block', marginLeft: '10px', marginBottom: '0' }}
-              value={targetScore}
-              onChange={(e) => setTargetScore(Number(e.target.value))}
-            />
-          </div>
-          <button style={styles.startBtn} onClick={startGame}>Start Game</button>
+
+          {playerIndex === 0 ? (
+            <div style={{ marginTop: '30px', padding: '20px', borderTop: '2px dashed #ccc' }}>
+              <div style={{ marginBottom: '20px', textAlign: 'center' }}>
+                <label style={{ color: 'black', fontSize: '18px', fontWeight: 'bold' }}>Target Score (Chat with opponent): </label>
+                <input
+                  type="number"
+                  style={{ ...styles.input, width: '100px', display: 'inline-block', marginLeft: '10px', marginBottom: '0' }}
+                  value={targetScore}
+                  onChange={(e) => emitUpdate({ targetScore: Number(e.target.value) })}
+                />
+              </div>
+              <button
+                style={{ ...styles.startBtn, opacity: (!players[0].name || !players[1].name) ? 0.5 : 1 }}
+                onClick={() => {
+                  if (players[0].name && players[1].name && targetScore > 0) {
+                    emitUpdate({
+                      networkPhase: 'playing',
+                      turnPhase: 'place_letter',
+                      messages: [...messages, { text: `🎮 Game started! First to ${Math.floor(targetScore / 2) + 1} points wins!`, time: new Date().toLocaleTimeString() }]
+                    });
+                  }
+                }}
+              >
+                🎮 Start Game Now
+              </button>
+              {(!players[0].name || !players[1].name) && <p style={{ textAlign: 'center', color: '#e91e63' }}>Waiting for both players to arrange names to start.</p>}
+            </div>
+          ) : (
+            <div style={{ marginTop: '30px', padding: '20px', textAlign: 'center', background: '#ffeacc', borderRadius: '12px' }}>
+              <h3 style={{ color: '#ff9800', margin: 0 }}>Target Score: {targetScore}</h3>
+              <p style={{ color: 'black', margin: '10px 0 0 0' }}>Only the Host can start the game.</p>
+            </div>
+          )}
         </div>
       </div>
     );
   }
 
-  if (gameState === 'ended') {
+  if (networkPhase === 'ended') {
     return (
       <div style={styles.container}>
         <h1 style={styles.title}>🏆 Game Over!</h1>
-        <div style={styles.scoreBoard}>
+        <div style={styles.scoreBoard} className="scoreBoardResponsive">
           {players.map((p, i) => (
             <div key={i} style={styles.finalScore}>
               <span style={styles.bigEmoji}>{p.emoji}</span>
-              <h2>{p.name}</h2>
-              <h1>{p.score} pts</h1>
+              <h2 style={{ color: 'black' }}>{p.name}</h2>
+              <h1 style={{ color: 'black' }}>{p.score} pts</h1>
             </div>
           ))}
         </div>
-        <button style={styles.startBtn} onClick={() => {
-          setPlayers([
-            { ...players[0], score: 0, missedTurns: 0 },
-            { ...players[1], score: 0, missedTurns: 0 }
-          ]);
-          setGameState('setup');
-          setMessages([]);
-          setClaimedWords([]);
-          setBoard(Array(10).fill(null).map(() => Array(10).fill('')));
-        }}>New Game</button>
+
+        {playerIndex === 0 ? (
+          <button style={{ ...styles.startBtn, maxWidth: '500px', display: 'block', margin: '0 auto' }} onClick={() => {
+            emitUpdate({
+              players: [
+                { ...players[0], score: 0, missedTurns: 0 },
+                { ...players[1], score: 0, missedTurns: 0 }
+              ],
+              networkPhase: 'setup',
+              messages: [],
+              claimedWords: [],
+              board: Array(10).fill(null).map(() => Array(10).fill(''))
+            });
+          }}>Restart Lobby (Host)</button>
+        ) : (
+          <h3 style={{ color: 'white', textAlign: 'center' }}>Waiting for Host to restart game...</h3>
+        )}
       </div>
     );
   }
@@ -258,23 +517,26 @@ export default function Game() {
       <div style={styles.header} className="headerResponsive">
         <div style={styles.playerInfo} className="playerInfoResponsive">
           {players.map((p, i) => (
-            <div key={i} style={{ ...styles.playerCard, ...(currentPlayer === i ? styles.activePlayer : {}) }}>
+            <div key={i} style={{ ...styles.playerCard, ...(currentPlayer === i ? styles.activePlayer : {}), opacity: currentPlayer === i ? 1 : 0.6 }}>
               <span style={styles.playerEmoji}>{p.emoji}</span>
               <div>
-                <div style={styles.playerName}>{p.name}</div>
+                <div style={styles.playerName}>{p.name}  {playerIndex === i ? '(You)' : ''}</div>
                 <div style={styles.score}>{p.score} / {Math.floor(targetScore / 2) + 1} (to win)</div>
                 <div style={styles.missedTurns}>Missed: {p.missedTurns}/5</div>
               </div>
             </div>
           ))}
         </div>
-        <div style={styles.timer} className="timerResponsive">⏱️ {timeLeft}s</div>
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+          <div style={styles.timer} className="timerResponsive">⏱️ {timeLeft}s</div>
+          <strong style={{ color: '#ffeb3b', marginTop: '5px', background: 'rgba(0,0,0,0.3)', padding: '5px 15px', borderRadius: '10px' }}>Room: {roomId}</strong>
+        </div>
       </div>
 
       <div style={styles.gameArea} className="gameAreaResponsive">
         <div style={styles.playArea}>
           <h2 style={styles.turnHeader}>
-            {players[currentPlayer].emoji} {players[currentPlayer].name}&apos;s Turn
+            {players[currentPlayer].emoji} {playerIndex === currentPlayer ? "It's Your Turn!" : `${players[currentPlayer].name}'s Turn (Waiting...)`}
           </h2>
           <div style={styles.instructions}>
             {turnPhase === 'place_letter' ?
@@ -283,7 +545,7 @@ export default function Game() {
             }
           </div>
 
-          <div>
+          <div style={{ opacity: playerIndex !== currentPlayer ? 0.6 : 1, pointerEvents: playerIndex !== currentPlayer ? 'none' : 'auto' }}>
             <div style={styles.boardContainer}>
               <div style={styles.grid} className="gridResponsive">
                 {board.map((row, rowIdx) => (
@@ -325,7 +587,7 @@ export default function Game() {
 
             <div style={styles.wordDisplay}>
               <div style={styles.formedWord}>
-                Word: <strong>{currentWord || '...'}</strong>
+                Word: <strong style={{ color: '#4caf50' }}>{currentWord || '...'}</strong>
               </div>
             </div>
 
@@ -368,9 +630,7 @@ export default function Game() {
             {turnPhase === 'place_letter' && (
               <button
                 style={styles.resetBtn}
-                onClick={() => {
-                  setSelectedCells([]);
-                }}
+                onClick={resetSelection}
               >
                 🔄 Reset Selection
               </button>
@@ -379,7 +639,7 @@ export default function Game() {
         </div>
 
         <div style={styles.chatArea}>
-          <h3>💬 Chat</h3>
+          <h3 style={{ color: 'black', margin: '0 0 15px 0' }}>💬 Live Net-Chat ({connectionStatus})</h3>
           <div style={styles.messages}>
             {messages.map((msg, i) => (
               <div key={i} style={styles.message}>
@@ -401,7 +661,7 @@ export default function Game() {
           <div style={styles.chatInputArea}>
             <input
               style={styles.chatInputBox}
-              placeholder="Type message..."
+              placeholder="Type cross-device message..."
               value={chatInput}
               onChange={(e) => setChatInput(e.target.value)}
               onKeyPress={(e) => e.key === 'Enter' && sendChat()}
@@ -433,9 +693,11 @@ const styles = {
     background: 'white',
     borderRadius: '20px',
     padding: '40px',
+    boxShadow: '0 10px 30px rgba(0,0,0,0.3)'
   },
   playerSetup: {
     marginBottom: '30px',
+    transition: 'opacity 0.3s'
   },
   input: {
     width: '100%',
@@ -491,10 +753,12 @@ const styles = {
     gap: '10px',
     alignItems: 'center',
     color: 'white',
+    transition: 'all 0.3s',
   },
   activePlayer: {
     background: 'rgba(255,255,255,0.4)',
     border: '3px solid white',
+    transform: 'scale(1.05)'
   },
   playerEmoji: {
     fontSize: '40px',
@@ -525,6 +789,7 @@ const styles = {
     borderRadius: '20px',
     padding: '30px',
     minHeight: '400px',
+    transition: 'opacity 0.3s'
   },
   turnHeader: {
     margin: '0 0 15px 0',
@@ -570,6 +835,7 @@ const styles = {
     fontWeight: 'bold',
     transition: 'all 0.2s',
     position: 'relative',
+    color: 'black'
   },
   selectedCell: {
     background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
@@ -623,42 +889,6 @@ const styles = {
     border: '2px solid #ffc107',
     marginBottom: '15px',
   },
-  claimTitle: {
-    fontSize: '20px',
-    fontWeight: 'bold',
-    marginBottom: '15px',
-    color: '#f57c00',
-    textAlign: 'center',
-  },
-  claimButtons: {
-    display: 'flex',
-    gap: '10px',
-    flexWrap: 'wrap',
-    justifyContent: 'center',
-  },
-  claimBtn: {
-    padding: '15px 20px',
-    fontSize: '18px',
-    fontWeight: 'bold',
-    background: 'linear-gradient(135deg, #4caf50 0%, #45a049 100%)',
-    color: 'white',
-    border: 'none',
-    borderRadius: '12px',
-    cursor: 'pointer',
-    transition: 'all 0.2s',
-    boxShadow: '0 4px 8px rgba(76, 175, 80, 0.3)',
-    minWidth: '80px',
-  },
-  pointsBadge: {
-    fontSize: '12px',
-    marginTop: '5px',
-    opacity: 0.9,
-  },
-  emptyState: {
-    color: '#999',
-    fontSize: '16px',
-    fontStyle: 'italic',
-  },
   resetBtn: {
     width: '100%',
     padding: '15px',
@@ -670,73 +900,6 @@ const styles = {
     cursor: 'pointer',
     fontWeight: 'bold',
     transition: 'all 0.2s',
-  },
-  submitBtn: {
-    padding: '15px 30px',
-    fontSize: '18px',
-    background: '#667eea',
-    color: 'white',
-    border: 'none',
-    borderRadius: '10px',
-    cursor: 'pointer',
-  },
-  wordDisplay: {
-    background: 'linear-gradient(135deg, #f0f0ff 0%, #e8e8ff 100%)',
-    padding: '20px',
-    borderRadius: '15px',
-    marginTop: '20px',
-    marginBottom: '20px',
-    border: '3px solid #667eea',
-    fontSize: '24px',
-    textAlign: 'center',
-    color: '#333',
-  },
-  meaningInput: {
-    width: '100%',
-    padding: '15px',
-    fontSize: '16px',
-    borderRadius: '10px',
-    border: '2px solid #ddd',
-    marginBottom: '15px',
-    minHeight: '100px',
-  },
-  btnGroup: {
-    display: 'flex',
-    gap: '10px',
-  },
-  challengeBtn: {
-    padding: '15px 30px',
-    fontSize: '18px',
-    background: '#ff6b6b',
-    color: 'white',
-    border: 'none',
-    borderRadius: '10px',
-    cursor: 'pointer',
-  },
-  challengeBox: {
-    background: '#fff3cd',
-    padding: '20px',
-    borderRadius: '15px',
-  },
-  yesBtn: {
-    flex: 1,
-    padding: '15px',
-    fontSize: '18px',
-    background: '#51cf66',
-    color: 'white',
-    border: 'none',
-    borderRadius: '10px',
-    cursor: 'pointer',
-  },
-  noBtn: {
-    flex: 1,
-    padding: '15px',
-    fontSize: '18px',
-    background: '#ff6b6b',
-    color: 'white',
-    border: 'none',
-    borderRadius: '10px',
-    cursor: 'pointer',
   },
   chatArea: {
     background: 'white',
@@ -751,17 +914,21 @@ const styles = {
     overflowY: 'auto',
     marginBottom: '15px',
     maxHeight: '350px',
+    borderBottom: '1px solid #ccc',
+    paddingBottom: '10px'
   },
   message: {
     padding: '8px',
     marginBottom: '5px',
     background: '#f0f0f0',
+    color: 'black',
     borderRadius: '8px',
-    fontSize: '14px',
+    fontSize: '15px',
   },
   time: {
     fontSize: '11px',
-    color: '#666',
+    color: '#888',
+    marginRight: '5px'
   },
   emojiPicker: {
     display: 'grid',
@@ -785,6 +952,7 @@ const styles = {
     padding: '10px',
     borderRadius: '10px',
     border: '2px solid #ddd',
+    color: 'black'
   },
   sendBtn: {
     padding: '10px 20px',
@@ -798,13 +966,14 @@ const styles = {
     display: 'flex',
     justifyContent: 'center',
     gap: '50px',
-    marginBottom: '30px',
+    marginBottom: '40px',
   },
   finalScore: {
     background: 'white',
     padding: '40px',
     borderRadius: '20px',
     textAlign: 'center',
+    boxShadow: '0 8px 20px rgba(0,0,0,0.2)'
   },
   bigEmoji: {
     fontSize: '80px',
